@@ -18,6 +18,7 @@
 
 #include "freertos/queue.h"
 #include "driver/gpio.h"
+
 //#include "esp_sleep.h"
 #include "esp_wifi.h"
 
@@ -40,6 +41,7 @@ static void set_led(uint16_t ls){
 
 static const struct ble_gatt_svc_def gatt_svr_svcs[] = {
   { //main service
+
     .type = BLE_GATT_SVC_TYPE_PRIMARY,
     .uuid = BLE_UUID16_DECLARE(0xf001),
     .characteristics = (struct ble_gatt_chr_def[])
@@ -86,6 +88,7 @@ volatile uint32_t acnt=0xffffffff;
 
 static xTimerHandle sec_tmr;
 static xTimerHandle led_tmr;
+
 
 static bool notify_state;
 
@@ -255,6 +258,7 @@ static void led_timer(xTimerHandle ev) {
     printf("%d %d %d\n",secs,active,led_prescaler);
   }
   led_tmr_init();
+
 }
 
 static int gap_event(struct ble_gap_event *event, void *arg) {
@@ -429,6 +433,7 @@ static int svc_cb(uint16_t conn_handle, uint16_t attr_handle, struct ble_gatt_ac
 
 
   return BLE_ATT_ERR_UNLIKELY;
+
 }
 
 int gatt_svr_init(void) {
@@ -508,6 +513,7 @@ void app_main(void) {
     io_conf.pull_up_en = 1;
     gpio_config(&io_conf);
   }
+
 
   //change gpio intrrupt type for one pin
   gpio_set_intr_type(0, GPIO_INTR_ANYEDGE);
