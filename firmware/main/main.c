@@ -11,6 +11,7 @@
 #include "host/util/util.h"
 #include "console/console.h"
 #include "services/gap/ble_svc_gap.h"
+
 #include "host/ble_hs.h"
 #include "host/ble_uuid.h"
 #include "services/gatt/ble_svc_gatt.h"
@@ -18,38 +19,76 @@
 #include "freertos/queue.h"
 #include "driver/gpio.h"
 
+//#include "esp_sleep.h"
+#include "esp_wifi.h"
+
+#define LED_PIN 16
 
 static int svc_cb(uint16_t conn_handle, uint16_t attr_handle, struct ble_gatt_access_ctxt *ctxt, void *arg);
-uint16_t hanhdler;
+uint16_t handler_f002;
+uint16_t led_settings=0;
+int16_t led_prescaler=0;
+uint16_t clicks=0x5;
+
+static void set_led(uint16_t ls){
+  if(ls&1)
+    gpio_set_level(LED_PIN, 0);
+  else
+    gpio_set_level(LED_PIN, 1);
+  led_settings=ls;
+  led_prescaler=0;
+}
+
 static const struct ble_gatt_svc_def gatt_svr_svcs[] = {
-  {
+  { //main service
+
     .type = BLE_GATT_SVC_TYPE_PRIMARY,
     .uuid = BLE_UUID16_DECLARE(0xf001),
     .characteristics = (struct ble_gatt_chr_def[])
     { {
         .uuid = BLE_UUID16_DECLARE(0xf002),
         .access_cb = svc_cb,
-        .val_handle = &hanhdler,
+        .val_handle = &handler_f002,
         .flags = BLE_GATT_CHR_F_NOTIFY,
       }, {
-        .uuid = BLE_UUID16_DECLARE(0xf002),
+        .uuid = BLE_UUID16_DECLARE(0xf003),
         .access_cb = svc_cb,
         .flags = BLE_GATT_CHR_F_READ,
+      }, { 0 }
+    }
+  },
+  { //button press times to alarm
+    .type = BLE_GATT_SVC_TYPE_PRIMARY,
+    .uuid = BLE_UUID16_DECLARE(0xf011),
+    .characteristics = (struct ble_gatt_chr_def[])
+    { {
+        .uuid = BLE_UUID16_DECLARE(0xf012),
+        .access_cb = svc_cb,
+        .flags = BLE_GATT_CHR_F_WRITE|BLE_GATT_CHR_F_READ
+      }, { 0 }
+    }
+  },
+  { //led status
+    .type = BLE_GATT_SVC_TYPE_PRIMARY,
+    .uuid = BLE_UUID16_DECLARE(0xf021),
+    .characteristics = (struct ble_gatt_chr_def[])
+    { {
+        .uuid = BLE_UUID16_DECLARE(0xf022),
+        .access_cb = svc_cb,
+        .flags = BLE_GATT_CHR_F_WRITE|BLE_GATT_CHR_F_READ
       }, { 0 }
     }
   },
   { 0 }
 };
 
-
-
-
-
-
 static xQueueHandle gpio_evt_queue = NULL;
-volatile uint64_t cnt=0;
+volatile uint32_t cnt=0;
+volatile uint32_t acnt=0xffffffff;
 
-static xTimerHandle notify_tmr;
+static xTimerHandle sec_tmr;
+static xTimerHandle led_tmr;
+
 
 static bool notify_state;
 
@@ -62,11 +101,9 @@ static int gap_event(struct ble_gap_event *event, void *arg);
 static uint8_t bbb_addr_type;
 
 static void next_cnt(void){
-  if(cnt<0x8000000000000000){
-    cnt++;
-    if(cnt==0x8000000000000000)
-      cnt=0;
-  }
+  cnt++;
+  //if(cnt==0x80000000) cnt=0;
+  if(acnt<0xffffffff) acnt++;
 }
 
 void cnt_as_bin(void *ptr);
@@ -74,10 +111,10 @@ void cnt_as_bin(void *ptr) {
   if(!notify_state)
     next_cnt();
   uint8_t *resp=(uint8_t*)ptr;
-  resp[0] = (cnt>>56)&0xff;
-  resp[1] = (cnt>>48)&0xff;
-  resp[2] = (cnt>>40)&0xff;
-  resp[3] = (cnt>>32)&0xff;
+  resp[0] = (acnt>>24)&0xff;
+  resp[1] = (acnt>>16)&0xff;
+  resp[2] = (acnt>>8)&0xff;
+  resp[3] = (acnt)&0xff;
   resp[4] = (cnt>>24)&0xff;
   resp[5] = (cnt>>16)&0xff;
   resp[6] = (cnt>>8)&0xff;
@@ -159,14 +196,21 @@ static void advertise(void) {
   }
 }
 
-static void beacon_stop(void) {
-  xTimerStop( notify_tmr, 1000 / portTICK_PERIOD_MS );
-}
-
-static void beacon_tmr_init(void) {
+static void led_tmr_init(void) {
   int rc;
 
-  if (xTimerReset(notify_tmr, 1000 / portTICK_PERIOD_MS ) == pdPASS) {
+  if (xTimerReset(led_tmr, 250 / portTICK_PERIOD_MS ) == pdPASS) {
+    rc = 0;
+  } else {
+    rc = 1;
+  }
+  assert(rc == 0);
+}
+
+static void sec_tmr_init(void) {
+  int rc;
+
+  if (xTimerReset(sec_tmr, 1000 / portTICK_PERIOD_MS ) == pdPASS) {
     rc = 0;
   } else {
     rc = 1;
@@ -176,38 +220,52 @@ static void beacon_tmr_init(void) {
 
 }
 
-static void beacon(xTimerHandle ev) {
+static void sec_timer(xTimerHandle ev) {
   static uint8_t resp[8];
   int rc;
 
-  if (!notify_state) {
-    beacon_stop();
-    return;
+  if (notify_state) {
+    printf("Timer %d %d\n",cnt,acnt);
+    cnt_as_bin(&resp);
+
+    next_cnt();
+    struct os_mbuf *om = ble_hs_mbuf_from_flat(resp, sizeof(resp));
+    rc = ble_gattc_notify_custom(conn_handle, handler_f002, om);
+
+    assert(rc == 0);
   }
+  sec_tmr_init();
+  /*
+  esp_sleep_enable_timer_wakeup(1000000L);
+  esp_light_sleep_start();
+  */
+}
 
-  printf("Timer %lld\n",cnt);
-  resp[0] = (cnt>>56)&0xff;
-  resp[1] = (cnt>>48)&0xff;
-  resp[2] = (cnt>>40)&0xff;
-  resp[3] = (cnt>>32)&0xff;
-  resp[4] = (cnt>>24)&0xff;
-  resp[5] = (cnt>>16)&0xff;
-  resp[6] = (cnt>>8)&0xff;
-  resp[7] = (cnt)&0xff;
 
-  next_cnt();
-  struct os_mbuf *om = ble_hs_mbuf_from_flat(resp, sizeof(resp));
-  rc = ble_gattc_notify_custom(conn_handle, hanhdler, om);
+static void led_timer(xTimerHandle ev) {
+  if(led_settings>1){
+    uint8_t secs=(led_settings&0xf00)>>8;
+    uint8_t active=(led_settings&0xf000)>>12;
+    led_prescaler--;
+    if(led_prescaler<1){
+      led_prescaler=secs;
+      gpio_set_level(LED_PIN, 1);
+    }
+    if(led_prescaler==active){
+      gpio_set_level(LED_PIN, 0);
+    }
 
-  assert(rc == 0);
+    printf("%d %d %d\n",secs,active,led_prescaler);
+  }
+  led_tmr_init();
 
-  beacon_tmr_init();
 }
 
 static int gap_event(struct ble_gap_event *event, void *arg) {
   switch (event->type) {
     case BLE_GAP_EVENT_CONNECT:
       /* A new connection was established or a connection attempt failed */
+      set_led(0);
       MODLOG_DFLT(INFO, "connection %s; status=%d\n",
           event->connect.status == 0 ? "established" : "failed",
           event->connect.status);
@@ -234,13 +292,11 @@ static int gap_event(struct ble_gap_event *event, void *arg) {
     case BLE_GAP_EVENT_SUBSCRIBE:
       MODLOG_DFLT(INFO, "subscribe event; cur_notify=%d\n value handle; "
           "val_handle=%d\n",
-          event->subscribe.cur_notify, hanhdler);
-      if (event->subscribe.attr_handle == hanhdler) {
+          event->subscribe.cur_notify, handler_f002);
+      if (event->subscribe.attr_handle == handler_f002) {
         notify_state = event->subscribe.cur_notify;
-        beacon_tmr_init();
-      } else if (event->subscribe.attr_handle != hanhdler) {
+      } else if (event->subscribe.attr_handle != handler_f002) {
         notify_state = event->subscribe.cur_notify;
-        beacon_stop();
       }
       ESP_LOGI("BLE_GAP_SUBSCRIBE_EVENT", "conn_handle from subscribe=%d", conn_handle);
       break;
@@ -269,6 +325,7 @@ static void on_sync(void) {
   print_addr(addr_val);
   MODLOG_DFLT(INFO, "\n");
 
+  advertise();
 }
 
 static void on_rst(int reason) {
@@ -291,17 +348,16 @@ static void IRAM_ATTR gpio_isr_handler(void* arg) {
   //ESP_LOGE(LOG_TAG, "%s GPIO INT\n", __func__);
 }
 
-#define CLICKS 5
 static void gpio_task_example(void* arg) {
   uint32_t active=0;
   uint32_t io_num;
   for(;;) {
     if(xQueueReceive(gpio_evt_queue, &io_num, 100)) {
-      if(io_num & 1 && active<CLICKS)
+      if(io_num & 1 && active<clicks)
         active++;
-      if(active==CLICKS){
+      if(active==clicks){
         printf("Triggered\n");
-        cnt=0xffffffffdeaddead;
+        acnt=0;
       }
       printf("GPIO intr, val: %d %d\n", io_num,active);
     }else{
@@ -314,53 +370,70 @@ static void gpio_task_example(void* arg) {
 }
 
 static int svc_cb(uint16_t conn_handle, uint16_t attr_handle, struct ble_gatt_access_ctxt *ctxt, void *arg) {
-  /* Sensor location, set to "Chest" */
-  uint16_t uuid;
-  int rc;
 
-  uuid = ble_uuid_u16(ctxt->chr->uuid);
+  uint16_t uuid = ble_uuid_u16(ctxt->chr->uuid);
 
-  char buf[8];
-  cnt_as_bin(buf);
+  /*
+     *     o  BLE_GATT_ACCESS_OP_READ_CHR
+     *     o  BLE_GATT_ACCESS_OP_WRITE_CHR
+     *     o  BLE_GATT_ACCESS_OP_READ_DSC
+     *     o  BLE_GATT_ACCESS_OP_WRITE_DSC
+     *     */
+ 
+  printf("op %04x ch %04x ah %04x uuid %04x\n",ctxt->op,conn_handle,attr_handle,uuid);
 
-  if (uuid == 0xf002) {
-    rc = os_mbuf_append(ctxt->om, buf, sizeof(buf));
+  if (ctxt->op==BLE_GATT_ACCESS_OP_WRITE_CHR) {
+    printf("Write len %d\n",ctxt->om->om_len);
+    int i;
+    for(i=0;i<ctxt->om->om_len;i++){
+      printf("%02x ",ctxt->om->om_data[i]);
+    }
+    printf("\n");
+  }
+
+  if (uuid == 0xf002 && ctxt->op==BLE_GATT_ACCESS_OP_READ_CHR) {
+    char buf[8];
+    cnt_as_bin(buf);
+    int rc = os_mbuf_append(ctxt->om, buf, sizeof(buf));
 
     return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
   }
 
-  assert(0);
-  return BLE_ATT_ERR_UNLIKELY;
-}
-
-void gatt_svr_register_cb(struct ble_gatt_register_ctxt *ctxt, void *arg) {
-  char buf[BLE_UUID_STR_LEN];
-
-  switch (ctxt->op) {
-    case BLE_GATT_REGISTER_OP_SVC:
-      MODLOG_DFLT(DEBUG, "registered service %s with handle=%d\n",
-          ble_uuid_to_str(ctxt->svc.svc_def->uuid, buf),
-          ctxt->svc.handle);
-      break;
-
-    case BLE_GATT_REGISTER_OP_CHR:
-      MODLOG_DFLT(DEBUG, "registering characteristic %s with "
-          "def_handle=%d val_handle=%d\n",
-          ble_uuid_to_str(ctxt->chr.chr_def->uuid, buf),
-          ctxt->chr.def_handle,
-          ctxt->chr.val_handle);
-      break;
-
-    case BLE_GATT_REGISTER_OP_DSC:
-      MODLOG_DFLT(DEBUG, "registering descriptor %s with handle=%d\n",
-          ble_uuid_to_str(ctxt->dsc.dsc_def->uuid, buf),
-          ctxt->dsc.handle);
-      break;
-
-    default:
-      assert(0);
-      break;
+  if (uuid == 0xf012 && ctxt->op==BLE_GATT_ACCESS_OP_WRITE_CHR && ctxt->om->om_len==2) {
+    uint16_t tclicks=htons(*(uint16_t*)ctxt->om->om_data);
+    printf("Tmp clicks %d\n",tclicks);
+    if(tclicks<15 && tclicks>0){
+      printf("set clicks %d\n",tclicks);
+      clicks=tclicks;
+      return 0;
+    }else
+      return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
   }
+
+  if (uuid == 0xf012 && ctxt->op==BLE_GATT_ACCESS_OP_READ_CHR) {
+    uint16_t beclicks=htons(clicks);
+    int rc = os_mbuf_append(ctxt->om, &beclicks, sizeof(beclicks));
+    return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+  }
+
+  if (uuid == 0xf022 && ctxt->op==BLE_GATT_ACCESS_OP_WRITE_CHR && ctxt->om->om_len==2) {
+    uint16_t tledset=htons(*(uint16_t*)ctxt->om->om_data);
+    printf("Tmo led set %04x\n",tledset);
+    set_led(tledset);
+    return 0;
+  }
+
+
+  if (uuid == 0xf022 && ctxt->op==BLE_GATT_ACCESS_OP_READ_CHR) {
+    uint16_t bels=htons(led_settings);
+    int rc = os_mbuf_append(ctxt->om, &bels, sizeof(bels));
+
+    return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+  }
+
+
+  return BLE_ATT_ERR_UNLIKELY;
+
 }
 
 int gatt_svr_init(void) {
@@ -386,6 +459,8 @@ int gatt_svr_init(void) {
 void app_main(void) {
   int rc;
 
+
+  esp_wifi_stop();
   /* Initialize NVS — it is used to store PHY calibration data */
   esp_err_t ret = nvs_flash_init();
   if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -402,7 +477,10 @@ void app_main(void) {
   ble_hs_cfg.reset_cb = on_rst;
 
   /* name, period/time,  auto reload, timer ID, callback */
-  notify_tmr = xTimerCreate("notify_tmr", pdMS_TO_TICKS(1000), pdTRUE, (void *)0, beacon);
+  sec_tmr = xTimerCreate("second_timer", pdMS_TO_TICKS(1000), pdTRUE, (void *)0, sec_timer);
+  sec_tmr_init();
+  led_tmr = xTimerCreate("led_timer", pdMS_TO_TICKS(250), pdTRUE, (void *)0, led_timer);
+  led_tmr_init();
 
   rc = gatt_svr_init();
   assert(rc == 0);
@@ -414,14 +492,28 @@ void app_main(void) {
   /* Start the task */
   nimble_port_freertos_init(bluetooth_task);
 
-  gpio_config_t io_conf;
-  io_conf.intr_type = GPIO_PIN_INTR_POSEDGE;
-  io_conf.pin_bit_mask = 1ULL; //GPIO0
-  //set as input mode    
-  io_conf.mode = GPIO_MODE_INPUT;
-  //enable pull-up mode
-  io_conf.pull_up_en = 1;
-  gpio_config(&io_conf);
+  set_led(1);
+  {
+    gpio_config_t io_conf;
+    io_conf.intr_type = GPIO_PIN_INTR_DISABLE;
+    io_conf.mode = GPIO_MODE_OUTPUT;
+    io_conf.pin_bit_mask = ((1ULL<<LED_PIN));
+    io_conf.pull_down_en = 0;
+    io_conf.pull_up_en = 0;
+    gpio_config(&io_conf);
+  }
+
+  {
+    gpio_config_t io_conf;
+    io_conf.intr_type = GPIO_PIN_INTR_POSEDGE;
+    io_conf.pin_bit_mask = 1ULL; //GPIO0
+    //set as input mode
+    io_conf.mode = GPIO_MODE_INPUT;
+    //enable pull-up mode
+    io_conf.pull_up_en = 1;
+    gpio_config(&io_conf);
+  }
+
 
   //change gpio intrrupt type for one pin
   gpio_set_intr_type(0, GPIO_INTR_ANYEDGE);
